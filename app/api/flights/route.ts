@@ -14,7 +14,7 @@ function normalizeFlight(item: any, kind: 'arrival' | 'departure'): FlightRecord
   const city = kind === 'arrival' ? item.departure?.airport : item.arrival?.airport;
 
   return {
-    id: item.flight?.iata || item.flight_date + Math.random().toString(36).slice(2, 8),
+    id: item.flight?.iata || `${item.flight_date ?? 'live'}-${kind}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
     airline: item.airline?.name || 'Unknown airline',
     flightNumber: item.flight?.iata || item.flight?.number || 'Unknown flight',
@@ -38,55 +38,90 @@ async function loadWeather(): Promise<WeatherPayload | undefined> {
   }
 }
 
+function buildAviationstackUrl(kind: 'arrival' | 'departure', date: string) {
+  const today = toIsoDate();
+  const url = new URL('https://api.aviationstack.com/v1/flights');
+  url.searchParams.set('access_key', API_KEY || '');
+  url.searchParams.set(kind === 'arrival' ? 'arr_iata' : 'dep_iata', AIRPORT_IATA);
+  url.searchParams.set('limit', '10');
+
+  // Free tier supports real-time flight data. Avoid flight_date for "today"
+  // so the request stays on the real-time endpoint rather than historical mode.
+  if (date !== today) {
+    url.searchParams.set('flight_date', date);
+  }
+
+  return url;
+}
+
+async function fetchAviationstackList(kind: 'arrival' | 'departure', date: string) {
+  const response = await fetch(buildAviationstackUrl(kind, date).toString(), {
+    next: { revalidate: 60 },
+  });
+
+  const json = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`Flight API failed for ${kind}s: ${response.status}`);
+  }
+
+  if (json?.error) {
+    const message = json.error.message || `Flight API returned an error for ${kind}s.`;
+    const code = json.error.code ? ` (${json.error.code})` : '';
+    throw new Error(`${message}${code}`);
+  }
+
+  return (json?.data ?? []) as any[];
+}
+
 async function fetchAviationstack(date: string): Promise<FlightsPayload> {
   if (!API_KEY) return getDemoFlights(date);
 
-  // Historical + real-time flights endpoint for the selected date.
-  // Depending on your plan, you may want to swap tomorrow searches to a future-schedules endpoint.
-  const url = new URL('https://api.aviationstack.com/v1/flights');
-  url.searchParams.set('access_key', API_KEY);
-  url.searchParams.set('flight_date', date);
-  url.searchParams.set('arr_iata', AIRPORT_IATA);
-  url.searchParams.set('limit', '10');
+  const today = toIsoDate();
+  const isToday = date === today;
 
-  const arrResponse = await fetch(url.toString(), { next: { revalidate: 60 } });
-  if (!arrResponse.ok) {
-    throw new Error(`Flight API failed for arrivals: ${arrResponse.status}`);
+  try {
+    const [arrivalsData, departuresData] = await Promise.all([
+      fetchAviationstackList('arrival', date),
+      fetchAviationstackList('departure', date),
+    ]);
+
+    const payload: FlightsPayload = {
+      date,
+      source: 'aviationstack',
+      arrivals: arrivalsData.map((item: any) => normalizeFlight(item, 'arrival')).slice(0, 2),
+      departures: departuresData.map((item: any) => normalizeFlight(item, 'departure')).slice(0, 2),
+    };
+
+    if (!payload.arrivals.length && !payload.departures.length) {
+      const note = isToday
+        ? 'No live flights were returned by the provider right now.'
+        : 'This free provider plan does not reliably support date-based flight lookups. Showing fallback rows instead.';
+      return { ...getDemoFlights(date), source: 'demo fallback', note };
+    }
+
+    if (payload.arrivals.length < 2 || payload.departures.length < 2) {
+      const demo = getDemoFlights(date);
+      payload.arrivals = [...payload.arrivals, ...demo.arrivals].slice(0, 2);
+      payload.departures = [...payload.departures, ...demo.departures].slice(0, 2);
+      payload.note = isToday
+        ? 'Live data was supplemented with fallback rows because fewer than 2 arrivals/departures were returned.'
+        : 'Date-based lookup returned limited data on the free plan, so fallback rows were added.';
+    }
+
+    return payload;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+
+    return {
+      ...getDemoFlights(date),
+      source: 'demo fallback',
+      note: isToday
+        ? 'Live flight API failed for today. Showing fallback rows instead.'
+        : 'The selected date requires a paid historical/schedule API feature or your own saved snapshots. Showing fallback rows instead.',
+      error: message,
+    };
   }
-
-  const depUrl = new URL('https://api.aviationstack.com/v1/flights');
-  depUrl.searchParams.set('access_key', API_KEY);
-  depUrl.searchParams.set('flight_date', date);
-  depUrl.searchParams.set('dep_iata', AIRPORT_IATA);
-  depUrl.searchParams.set('limit', '10');
-
-  const depResponse = await fetch(depUrl.toString(), { next: { revalidate: 60 } });
-  if (!depResponse.ok) {
-    throw new Error(`Flight API failed for departures: ${depResponse.status}`);
-  }
-
-  const arrivalsJson = await arrResponse.json();
-  const departuresJson = await depResponse.json();
-
-  const payload: FlightsPayload = {
-    date,
-    source: 'aviationstack',
-    arrivals: (arrivalsJson.data ?? []).map((item: any) => normalizeFlight(item, 'arrival')).slice(0, 2),
-    departures: (departuresJson.data ?? []).map((item: any) => normalizeFlight(item, 'departure')).slice(0, 2),
-  };
-
-  if (!payload.arrivals.length && !payload.departures.length) {
-    return { ...getDemoFlights(date), source: 'demo fallback', note: 'No live flights returned for that date/provider plan.' };
-  }
-
-  if (payload.arrivals.length < 2 || payload.departures.length < 2) {
-    const demo = getDemoFlights(date);
-    payload.arrivals = [...payload.arrivals, ...demo.arrivals].slice(0, 2);
-    payload.departures = [...payload.departures, ...demo.departures].slice(0, 2);
-    payload.note = 'Live data was supplemented with demo rows because fewer than 2 arrivals/departures were returned.';
-  }
-
-  return payload;
 }
 
 export async function GET(request: NextRequest) {
