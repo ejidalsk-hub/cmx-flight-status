@@ -1,23 +1,36 @@
-import trainedModel from './trained-model.json';
-import type { FlightRecord, WeatherPayload } from './types';
+import trainedModel from '@/lib/trained-model.json';
+import type { FlightRecord, WeatherPayload } from '@/lib/types';
 
-type TargetName = 'delayed' | 'cancelled';
+type RiskResult = FlightRecord['risk'];
+
 type FeatureName =
   | 'kind'
   | 'airline_family'
   | 'route'
-  | 'month_bucket'
-  | 'hour_bucket'
+  | 'season'
+  | 'time_bucket'
   | 'wind_bucket'
-  | 'precip_flag'
-  | 'freezing_flag'
-  | 'fog_flag'
-  | 'status_bucket';
+  | 'weather_flag';
 
-type ModelJson = typeof trainedModel;
+type FeatureValues = Record<FeatureName, string>;
 
-function clampPercent(value: number) {
-  return Math.max(1, Math.min(99, Math.round(value)));
+type ClassLikelihood = Record<string, number>;
+
+type ModelShape = {
+  delay: {
+    priors: Record<'0' | '1', number>;
+    likelihoods: Record<FeatureName, Record<'0' | '1', ClassLikelihood>>;
+  };
+  cancellation: {
+    priors: Record<'0' | '1', number>;
+    likelihoods: Record<FeatureName, Record<'0' | '1', ClassLikelihood>>;
+  };
+};
+
+const model = trainedModel as ModelShape;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function probabilityFromLogs(log0: number, log1: number) {
@@ -27,102 +40,155 @@ function probabilityFromLogs(log0: number, log1: number) {
   return p1 / (p0 + p1);
 }
 
-function safeDate(raw?: string | null) {
+function percent(value: number) {
+  return Math.round(clamp(value * 100, 1, 99));
+}
+
+function getMonth(flight: FlightRecord) {
+  const raw = flight.scheduledTime || flight.actualTime;
   if (!raw) return null;
   const d = new Date(raw);
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (Number.isNaN(d.getTime())) return null;
+  return d.getUTCMonth() + 1;
 }
 
-function getMonthBucket(flight: FlightRecord) {
-  const d = safeDate(flight.scheduledTime || flight.actualTime);
-  const month = d ? d.getUTCMonth() + 1 : null;
-  if (month == null) return 'shoulder';
+function getHour(flight: FlightRecord) {
+  const raw = flight.scheduledTime || flight.actualTime;
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.getUTCHours();
+}
+
+function detectSeason(month: number | null): string {
+  if (month === null) return 'shoulder';
   if ([11, 12, 1, 2, 3].includes(month)) return 'winter';
-  if ([4, 5, 10].includes(month)) return 'shoulder';
-  return 'summer';
+  if ([6, 7, 8].includes(month)) return 'summer';
+  return 'shoulder';
 }
 
-function getHourBucket(flight: FlightRecord) {
-  const d = safeDate(flight.scheduledTime || flight.actualTime);
-  const hour = d ? d.getUTCHours() : null;
-  if (hour == null) return 'midday';
+function detectTimeBucket(hour: number | null): string {
+  if (hour === null) return 'midday';
   if (hour <= 7) return 'early';
-  if (hour >= 20) return 'late';
-  return 'midday';
+  if (hour <= 14) return 'midday';
+  if (hour <= 19) return 'afternoon_evening';
+  return 'night';
 }
 
-function getWindBucket(weather?: WeatherPayload) {
+function detectAirlineFamily(flight: FlightRecord): string {
+  const airline = flight.airline.toLowerCase();
+  const number = flight.flightNumber.toLowerCase();
+
+  const isUnitedFamily =
+    airline.includes('united') ||
+    airline.includes('skywest') ||
+    airline.includes('united express') ||
+    number.startsWith('ua') ||
+    number.startsWith('oo');
+
+  return isUnitedFamily ? 'united_family' : 'other';
+}
+
+function detectRoute(flight: FlightRecord): string {
+  const city = flight.city.toLowerCase();
+
+  if (city.includes('chicago') || city.includes("o'hare") || city.includes('ohare') || city.includes('ord')) {
+    return flight.kind === 'arrival' ? 'ord_cmx' : 'cmx_ord';
+  }
+
+  return 'other';
+}
+
+function detectWindBucket(weather?: WeatherPayload): string {
   const wind = weather?.current.windMph ?? 0;
-  if (wind >= 35) return 'extreme';
-  if (wind >= 25) return 'high';
+  if (wind >= 30) return 'high';
   if (wind >= 15) return 'moderate';
   return 'low';
 }
 
-function getConditionText(weather?: WeatherPayload) {
-  const now = weather?.current.conditions ?? '';
-  const forecast = weather?.forecast?.map((p) => p.shortForecast).join(' ') ?? '';
-  return `${now} ${forecast}`.toLowerCase();
+function detectWeatherFlag(weather?: WeatherPayload): string {
+  const current = weather?.current.conditions || '';
+  const forecast = weather?.forecast?.map((p) => p.shortForecast).join(' ') || '';
+  const combined = `${current} ${forecast}`.toLowerCase();
+
+  if (
+    combined.includes('snow') ||
+    combined.includes('blizzard') ||
+    combined.includes('flurries') ||
+    combined.includes('wintry')
+  ) {
+    return 'snow';
+  }
+
+  if (
+    combined.includes('freezing') ||
+    combined.includes('ice') ||
+    combined.includes('icy') ||
+    combined.includes('sleet')
+  ) {
+    return 'freezing';
+  }
+
+  if (
+    combined.includes('fog') ||
+    combined.includes('mist') ||
+    combined.includes('haze') ||
+    combined.includes('blowing snow')
+  ) {
+    return 'low_visibility';
+  }
+
+  if (
+    combined.includes('rain') ||
+    combined.includes('showers') ||
+    combined.includes('storm') ||
+    combined.includes('thunder')
+  ) {
+    return 'rain';
+  }
+
+  return 'clear';
 }
 
-function hasAny(text: string, words: string[]) {
-  return words.some((word) => text.includes(word));
-}
-
-function buildFeatures(flight: FlightRecord, weather?: WeatherPayload): Record<FeatureName, string> {
-  const conditions = getConditionText(weather);
-  const airlineLower = flight.airline.toLowerCase();
-  const numberLower = flight.flightNumber.toLowerCase();
-  const cityLower = flight.city.toLowerCase();
-  const statusLower = flight.status.toLowerCase();
-
-  const airlineFamily =
-    airlineLower.includes('united') ||
-    airlineLower.includes('skywest') ||
-    airlineLower.includes('united express') ||
-    numberLower.startsWith('ua') ||
-    numberLower.startsWith('oo')
-      ? 'united_family'
-      : 'other';
-
-  const route = cityLower.includes('chicago') || cityLower.includes("o'hare") || cityLower.includes('ohare') || cityLower.includes('ord')
-    ? flight.kind === 'arrival'
-      ? 'ord_cmx'
-      : 'cmx_ord'
-    : 'other';
-
-  const statusBucket = statusLower.includes('delay')
-    ? 'delayed'
-    : statusLower.includes('active')
-      ? 'active'
-      : statusLower.includes('landed')
-        ? 'landed'
-        : 'scheduled';
+function buildFeatureValues(flight: FlightRecord, weather?: WeatherPayload): FeatureValues {
+  const month = getMonth(flight);
+  const hour = getHour(flight);
 
   return {
     kind: flight.kind,
-    airline_family: airlineFamily,
-    route,
-    month_bucket: getMonthBucket(flight),
-    hour_bucket: getHourBucket(flight),
-    wind_bucket: getWindBucket(weather),
-    precip_flag: hasAny(conditions, ['snow', 'rain', 'showers', 'storm', 'thunder']) ? '1' : '0',
-    freezing_flag: hasAny(conditions, ['freezing', 'ice', 'sleet', 'icy']) ? '1' : '0',
-    fog_flag: hasAny(conditions, ['fog', 'mist', 'haze', 'blowing snow']) ? '1' : '0',
-    status_bucket: statusBucket,
+    airline_family: detectAirlineFamily(flight),
+    route: detectRoute(flight),
+    season: detectSeason(month),
+    time_bucket: detectTimeBucket(hour),
+    wind_bucket: detectWindBucket(weather),
+    weather_flag: detectWeatherFlag(weather),
   };
 }
 
-function classify(target: TargetName, featureValues: Record<FeatureName, string>) {
-  const model = (trainedModel as ModelJson).models[target];
+function scoreModel(
+  modelPart: ModelShape['delay'] | ModelShape['cancellation'],
+  featureValues: FeatureValues,
+) {
+  let log0 = Math.log(modelPart.priors['0'] ?? 0.5);
+  let log1 = Math.log(modelPart.priors['1'] ?? 0.5);
 
-  let log0 = Math.log(model.priors['0']);
-  let log1 = Math.log(model.priors['1']);
+  const featureNames: FeatureName[] = [
+    'kind',
+    'airline_family',
+    'route',
+    'season',
+    'time_bucket',
+    'wind_bucket',
+    'weather_flag',
+  ];
 
-  for (const feature of Object.keys(featureValues) as FeatureName[]) {
+  for (const feature of featureNames) {
     const value = featureValues[feature];
-    const like0 = model.likelihoods[feature]['0'][value] ?? 1e-6;
-    const like1 = model.likelihoods[feature]['1'][value] ?? 1e-6;
+    const featureLikelihoods = modelPart.likelihoods[feature];
+
+    const like0 = featureLikelihoods?.['0']?.[value] ?? 1e-6;
+    const like1 = featureLikelihoods?.['1']?.[value] ?? 1e-6;
+
     log0 += Math.log(like0);
     log1 += Math.log(like1);
   }
@@ -130,35 +196,63 @@ function classify(target: TargetName, featureValues: Record<FeatureName, string>
   return probabilityFromLogs(log0, log1);
 }
 
-function buildReason(features: Record<FeatureName, string>) {
-  const reasons: string[] = [];
+function buildReason(flight: FlightRecord, weather?: WeatherPayload) {
+  const parts: string[] = [];
 
-  if (features.month_bucket === 'winter') reasons.push('winter-season pattern');
-  if (features.wind_bucket === 'moderate') reasons.push('elevated winds');
-  if (features.wind_bucket === 'high' || features.wind_bucket === 'extreme') reasons.push('strong winds');
-  if (features.precip_flag === '1') reasons.push('precipitation signal');
-  if (features.freezing_flag === '1') reasons.push('freezing conditions');
-  if (features.fog_flag === '1') reasons.push('reduced visibility');
-  if (features.route === 'ord_cmx' || features.route === 'cmx_ord') reasons.push('CMX-ORD route sensitivity');
-  if (features.status_bucket === 'delayed') reasons.push('current delayed status');
-  if (features.status_bucket === 'active') reasons.push('active aircraft rotation');
-  if (features.hour_bucket === 'early') reasons.push('early-day schedule');
-  if (features.hour_bucket === 'late') reasons.push('late-day schedule');
+  const route = detectRoute(flight);
+  const season = detectSeason(getMonth(flight));
+  const wind = detectWindBucket(weather);
+  const wx = detectWeatherFlag(weather);
 
-  return reasons.length ? reasons.join(', ') : 'historical baseline pattern';
+  if (route === 'cmx_ord' || route === 'ord_cmx') parts.push('CMX-ORD routing');
+  if (season === 'winter') parts.push('winter operations');
+  if (wind === 'moderate') parts.push('gusty winds');
+  if (wind === 'high') parts.push('strong winds');
+  if (wx === 'snow') parts.push('snow');
+  if (wx === 'freezing') parts.push('freezing conditions');
+  if (wx === 'low_visibility') parts.push('low visibility');
+  if (wx === 'rain') parts.push('rain');
+
+  const status = flight.status.toLowerCase();
+  if (status.includes('delayed')) parts.push('current delayed status');
+  if (status.includes('active')) parts.push('active flight status');
+
+  return parts.length ? parts.join(', ') : 'trained baseline classifier';
 }
 
-export function addBaselineRisk(flight: FlightRecord, weather?: WeatherPayload): FlightRecord {
-  const features = buildFeatures(flight, weather);
-  const delayProbability = classify('delayed', features);
-  const cancellationProbability = classify('cancelled', features);
+export function addBaselineRisk(
+  flight: FlightRecord,
+  weather?: WeatherPayload,
+): FlightRecord {
+  const featureValues = buildFeatureValues(flight, weather);
+
+  let delayProb = scoreModel(model.delay, featureValues);
+  let cancelProb = scoreModel(model.cancellation, featureValues);
+
+  const status = flight.status.toLowerCase();
+
+  if (status.includes('delayed')) {
+    delayProb = Math.min(0.95, delayProb + 0.2);
+    cancelProb = Math.min(0.8, cancelProb + 0.05);
+  }
+
+  if (status.includes('landed')) {
+    delayProb = Math.max(0.01, delayProb - 0.2);
+    cancelProb = Math.max(0.01, cancelProb - 0.05);
+  }
+
+  if (status.includes('active')) {
+    delayProb = Math.min(0.95, delayProb + 0.08);
+  }
+
+  const risk: RiskResult = {
+    delay: percent(delayProb),
+    cancellation: percent(Math.min(cancelProb, delayProb)),
+    reason: buildReason(flight, weather),
+  };
 
   return {
     ...flight,
-    risk: {
-      delay: clampPercent(delayProbability * 100),
-      cancellation: clampPercent(cancellationProbability * 100),
-      reason: buildReason(features),
-    },
+    risk,
   };
 }
