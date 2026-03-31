@@ -10,24 +10,24 @@ type FeatureName =
   | 'season'
   | 'time_bucket'
   | 'wind_bucket'
-  | 'weather_flag';
+  | 'weather_flag'
+  | 'status_bucket';
 
 type FeatureValues = Record<FeatureName, string>;
 
-type ClassLikelihood = Record<string, number>;
+type BinaryModel = {
+  priors: Record<'0' | '1', number>;
+  likelihoods: Record<string, Record<'0' | '1', Record<string, number>>>;
+};
 
-type ModelShape = {
-  delay: {
-    priors: Record<'0' | '1', number>;
-    likelihoods: Record<FeatureName, Record<'0' | '1', ClassLikelihood>>;
-  };
-  cancellation: {
-    priors: Record<'0' | '1', number>;
-    likelihoods: Record<FeatureName, Record<'0' | '1', ClassLikelihood>>;
+type TrainedModelShape = {
+  models: {
+    delayed: BinaryModel;
+    cancelled: BinaryModel;
   };
 };
 
-const model = trainedModel as ModelShape;
+const model = trainedModel as unknown as TrainedModelShape;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -92,7 +92,12 @@ function detectAirlineFamily(flight: FlightRecord): string {
 function detectRoute(flight: FlightRecord): string {
   const city = flight.city.toLowerCase();
 
-  if (city.includes('chicago') || city.includes("o'hare") || city.includes('ohare') || city.includes('ord')) {
+  if (
+    city.includes('chicago') ||
+    city.includes("o'hare") ||
+    city.includes('ohare') ||
+    city.includes('ord')
+  ) {
     return flight.kind === 'arrival' ? 'ord_cmx' : 'cmx_ord';
   }
 
@@ -150,6 +155,17 @@ function detectWeatherFlag(weather?: WeatherPayload): string {
   return 'clear';
 }
 
+function detectStatusBucket(flight: FlightRecord): string {
+  const status = flight.status.toLowerCase();
+
+  if (status.includes('delayed')) return 'delayed';
+  if (status.includes('active')) return 'active';
+  if (status.includes('landed')) return 'landed';
+  if (status.includes('scheduled')) return 'scheduled';
+
+  return 'other';
+}
+
 function buildFeatureValues(flight: FlightRecord, weather?: WeatherPayload): FeatureValues {
   const month = getMonth(flight);
   const hour = getHour(flight);
@@ -162,32 +178,22 @@ function buildFeatureValues(flight: FlightRecord, weather?: WeatherPayload): Fea
     time_bucket: detectTimeBucket(hour),
     wind_bucket: detectWindBucket(weather),
     weather_flag: detectWeatherFlag(weather),
+    status_bucket: detectStatusBucket(flight),
   };
 }
 
-function scoreModel(
-  modelPart: ModelShape['delay'] | ModelShape['cancellation'],
-  featureValues: FeatureValues,
-) {
+function scoreModel(modelPart: BinaryModel, featureValues: FeatureValues) {
   let log0 = Math.log(modelPart.priors['0'] ?? 0.5);
   let log1 = Math.log(modelPart.priors['1'] ?? 0.5);
 
-  const featureNames: FeatureName[] = [
-    'kind',
-    'airline_family',
-    'route',
-    'season',
-    'time_bucket',
-    'wind_bucket',
-    'weather_flag',
-  ];
+  const featureNames = Object.keys(featureValues) as FeatureName[];
 
   for (const feature of featureNames) {
     const value = featureValues[feature];
-    const featureLikelihoods = modelPart.likelihoods[feature];
+    const featureLikelihoods = modelPart.likelihoods[feature] ?? { '0': {}, '1': {} };
 
-    const like0 = featureLikelihoods?.['0']?.[value] ?? 1e-6;
-    const like1 = featureLikelihoods?.['1']?.[value] ?? 1e-6;
+    const like0 = featureLikelihoods['0']?.[value] ?? 1e-6;
+    const like1 = featureLikelihoods['1']?.[value] ?? 1e-6;
 
     log0 += Math.log(like0);
     log1 += Math.log(like1);
@@ -203,6 +209,7 @@ function buildReason(flight: FlightRecord, weather?: WeatherPayload) {
   const season = detectSeason(getMonth(flight));
   const wind = detectWindBucket(weather);
   const wx = detectWeatherFlag(weather);
+  const status = detectStatusBucket(flight);
 
   if (route === 'cmx_ord' || route === 'ord_cmx') parts.push('CMX-ORD routing');
   if (season === 'winter') parts.push('winter operations');
@@ -212,12 +219,10 @@ function buildReason(flight: FlightRecord, weather?: WeatherPayload) {
   if (wx === 'freezing') parts.push('freezing conditions');
   if (wx === 'low_visibility') parts.push('low visibility');
   if (wx === 'rain') parts.push('rain');
+  if (status === 'delayed') parts.push('current delayed status');
+  if (status === 'active') parts.push('active flight status');
 
-  const status = flight.status.toLowerCase();
-  if (status.includes('delayed')) parts.push('current delayed status');
-  if (status.includes('active')) parts.push('active flight status');
-
-  return parts.length ? parts.join(', ') : 'trained baseline classifier';
+  return parts.length ? parts.join(', ') : 'trained classifier baseline';
 }
 
 export function addBaselineRisk(
@@ -226,8 +231,8 @@ export function addBaselineRisk(
 ): FlightRecord {
   const featureValues = buildFeatureValues(flight, weather);
 
-  let delayProb = scoreModel(model.delay, featureValues);
-  let cancelProb = scoreModel(model.cancellation, featureValues);
+  let delayProb = scoreModel(model.models.delayed, featureValues);
+  let cancelProb = scoreModel(model.models.cancelled, featureValues);
 
   const status = flight.status.toLowerCase();
 
