@@ -14,7 +14,9 @@ function normalizeFlight(item: any, kind: 'arrival' | 'departure'): FlightRecord
   const city = kind === 'arrival' ? item.departure?.airport : item.arrival?.airport;
 
   return {
-    id: item.flight?.iata || `${item.flight_date ?? 'live'}-${kind}-${Math.random().toString(36).slice(2, 8)}`,
+    id:
+      item.flight?.iata ||
+      `${item.flight_date ?? 'live'}-${kind}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
     airline: item.airline?.name || 'Unknown airline',
     flightNumber: item.flight?.iata || item.flight?.number || 'Unknown flight',
@@ -25,6 +27,39 @@ function normalizeFlight(item: any, kind: 'arrival' | 'departure'): FlightRecord
     gate: endpoint?.gate || null,
     aircraft: item.aircraft?.registration || item.aircraft?.icao24 || null,
   };
+}
+
+function isLikelyCmxFlight(item: any, kind: 'arrival' | 'departure') {
+  const arrIata = String(item.arrival?.iata || '').toUpperCase();
+  const depIata = String(item.departure?.iata || '').toUpperCase();
+  const airline = String(item.airline?.name || '').toLowerCase();
+  const flightIata = String(item.flight?.iata || '').toUpperCase();
+  const flightStatus = String(item.flight_status || '').toLowerCase();
+
+  const touchesCmx =
+    (kind === 'arrival' && arrIata === 'CMX') ||
+    (kind === 'departure' && depIata === 'CMX');
+
+  const touchesOrd = arrIata === 'ORD' || depIata === 'ORD';
+
+  const likelyUnited =
+    airline.includes('united') ||
+    airline.includes('skywest') ||
+    airline.includes('united express') ||
+    flightIata.startsWith('UA') ||
+    flightIata.startsWith('OO');
+
+  const notCargoOrRandom =
+    !airline.includes('fedex') &&
+    !airline.includes('ameriflight') &&
+    !airline.includes('vista') &&
+    !airline.includes('uganda');
+
+  return touchesCmx && touchesOrd && likelyUnited && notCargoOrRandom && flightStatus !== 'cancelled';
+}
+
+function filterCmxFlights(items: any[], kind: 'arrival' | 'departure') {
+  return items.filter((item) => isLikelyCmxFlight(item, kind));
 }
 
 async function loadWeather(): Promise<WeatherPayload | undefined> {
@@ -41,12 +76,12 @@ async function loadWeather(): Promise<WeatherPayload | undefined> {
 function buildAviationstackUrl(kind: 'arrival' | 'departure', date: string) {
   const today = toIsoDate();
   const url = new URL('https://api.aviationstack.com/v1/flights');
+
   url.searchParams.set('access_key', API_KEY || '');
   url.searchParams.set(kind === 'arrival' ? 'arr_iata' : 'dep_iata', AIRPORT_IATA);
-  url.searchParams.set('limit', '10');
+  url.searchParams.set('limit', '25');
 
-  // Free tier supports real-time flight data. Avoid flight_date for "today"
-  // so the request stays on the real-time endpoint rather than historical mode.
+  // Free tier supports real-time today better than historical/date-based queries.
   if (date !== today) {
     url.searchParams.set('flight_date', date);
   }
@@ -86,17 +121,20 @@ async function fetchAviationstack(date: string): Promise<FlightsPayload> {
       fetchAviationstackList('departure', date),
     ]);
 
+    const filteredArrivals = filterCmxFlights(arrivalsData, 'arrival');
+    const filteredDepartures = filterCmxFlights(departuresData, 'departure');
+
     const payload: FlightsPayload = {
       date,
       source: 'aviationstack',
-      arrivals: arrivalsData.map((item: any) => normalizeFlight(item, 'arrival')).slice(0, 2),
-      departures: departuresData.map((item: any) => normalizeFlight(item, 'departure')).slice(0, 2),
+      arrivals: filteredArrivals.map((item: any) => normalizeFlight(item, 'arrival')).slice(0, 2),
+      departures: filteredDepartures.map((item: any) => normalizeFlight(item, 'departure')).slice(0, 2),
     };
 
     if (!payload.arrivals.length && !payload.departures.length) {
       const note = isToday
-        ? 'No live flights were returned by the provider right now.'
-        : 'This free provider plan does not reliably support date-based flight lookups. Showing fallback rows instead.';
+        ? 'No valid live CMX flights were returned by the provider right now. Showing fallback rows instead.'
+        : 'This free provider plan does not reliably support date-based CMX flight lookups. Showing fallback rows instead.';
       return { ...getDemoFlights(date), source: 'demo fallback', note };
     }
 
@@ -105,7 +143,7 @@ async function fetchAviationstack(date: string): Promise<FlightsPayload> {
       payload.arrivals = [...payload.arrivals, ...demo.arrivals].slice(0, 2);
       payload.departures = [...payload.departures, ...demo.departures].slice(0, 2);
       payload.note = isToday
-        ? 'Live data was supplemented with fallback rows because fewer than 2 arrivals/departures were returned.'
+        ? 'Only flights matching likely CMX-ORD United/SkyWest service were kept. Fallback rows were added because fewer than 2 valid live flights were returned.'
         : 'Date-based lookup returned limited data on the free plan, so fallback rows were added.';
     }
 
