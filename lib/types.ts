@@ -37,9 +37,10 @@ export type WeatherPayload = {
 export type FlightsPayload = {
   date: string;
   source: string;
+  note?: string;
+  error?: string;
   arrivals: FlightRecord[];
   departures: FlightRecord[];
-  note?: string;
 };
 
 export type WebcamPayload = {
