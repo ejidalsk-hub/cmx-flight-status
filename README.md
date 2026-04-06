@@ -7,4 +7,4 @@ Author: Ethan Idalski
 - Live Houghton weather using the National Weather Service API
 - Airport webcam section
 - Auto refresh
-- Optional SAT5520-style baseline risk estimate
+- Baseline risk estimate
